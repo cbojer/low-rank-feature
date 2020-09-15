@@ -108,6 +108,8 @@ arima_preds <- train[timeseries %in% ts_to_fc, arima_monthly_fc(value), by = .(t
 arima_joined <- merge(arima_preds, cp_dt[time > 39]) %>% .[ ,error := value - .preds]
 arima_joined$error %>% rmse
 
+saveRDS(arima_preds, "arima_carparts.rds")
+
 theta_preds <- train[timeseries %in% ts_to_fc, theta_monthly_fc(value), by = .(timeseries)]
 theta_joined <- merge(theta_preds, cp_dt[time > 39]) %>% .[ ,error := value - .preds]
 theta_joined$error %>% rmse
@@ -117,9 +119,8 @@ library(h2o)
 
 h2o.init()
 
-matrix_dt <- carparts %>% 
+matrix_dt <- carparts[1:39,] %>% 
   as.data.table()
-
 
 dt_h2o <- as.h2o(matrix_dt)
 
@@ -133,11 +134,11 @@ basic_glrm <- h2o.glrm(
   transform = "STANDARDIZE", 
   max_iterations = 2000,
   seed = 123,
-  impute_original = TRUE
+  impute_original = TRUE,
+  ignore_const_cols = FALSE
 )
 
 rec_scaled <- h2o.reconstruct(basic_glrm, dt_h2o, reverse_transform = TRUE)
-
 
 err <- (as.matrix(matrix_dt) - as.matrix(rec_scaled))
 err %>% rmse
@@ -174,8 +175,17 @@ non_scaled_glrm <- h2o.glrm(
 )
 
 
-summary(non_scaled_glrm)
+summary(basic_glrm)
 
-plot(non_scaled_glrm)
+plot(basic_glrm)
 
-non_scaled_glrm@model$importance
+basic_glrm@model$importance
+
+contains_na <- is.na(carparts[1:39,]) %>% colSums() %>% `>`(0)
+carparts[1:39,contains_na] %>% View
+
+library(tsfeatures)
+
+tsfeatures::stl_features(carparts[1:39,100] %>% na.omit() %>% ts(frequency = 12))
+tsfeatures::entropy(carparts[1:39,100] %>% na.omit() %>% ts(frequency = 12))
+tsfeatures::entropy(carparts[1:39,1101] %>% na.omit() %>% ts(frequency = 12))
