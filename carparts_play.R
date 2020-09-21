@@ -5,8 +5,6 @@ library(forecast)
 library(magrittr)
 library(data.table)
 
-mse <- function(e, na.rm = TRUE) e %>% raise_to_power(2) %>% mean(na.rm = na.rm)
-rmse <- function(e, na.rm = TRUE) e %>% mse(na.rm = na.rm) %>% sqrt
 
 # First step: Ts mat to Data.table
 # Melt
@@ -76,39 +74,16 @@ global_ar_model$residuals %>% rmse()
 # For auto arima, only forecast those who are in test
 ts_to_fc <- unique(test$timeseries)
 
-forecast_pkg_fc<- function(x, fc_func, freq, h) {
-  x %>% ts(frequency = freq) %>% fc_func(h = h) %>% magrittr::extract2("mean")
-}
 
-arima_fc_func <- function(x, h) auto.arima(x) %>% forecast(h = h)
-ets_fc_func <- function(x, h) ets(x) %>% forecast(h = h)
-
-
-arima_fc <- function(x, freq, h) {
-  fc <- forecast_pkg_fc(x, arima_fc_func, freq, h)
-  list(.preds = as.numeric(fc), time = 40:51)
-}
-
-theta_fc <- function(x, freq, h) {
-  fc <- forecast_pkg_fc(x, thetaf, freq, h)
-  list(.preds = as.numeric(fc), time = 40:51)
-}
-
-ets_fc <- function(x, freq, h) {
-  fc <- forecast_pkg_fc(x, ets_fc_func, freq, h)
-  list(.preds = as.numeric(fc), time = 40:51)
-}
-
-arima_monthly_fc <- purrr::partial(arima_fc, freq = 12, h = 12)
-theta_monthly_fc <- purrr::partial(theta_fc, freq = 12, h = 12)
-ets_monthly_fc <- purrr::partial(ets_fc, freq = 12, h = 12)
 
 arima_preds <- train[timeseries %in% ts_to_fc, arima_monthly_fc(value), by = .(timeseries)]
+saveRDS(arima_preds, "arima_carparts.rds")
+arima_preds <- readRDS("arima_carparts.rds")
 
 arima_joined <- merge(arima_preds, cp_dt[time > 39]) %>% .[ ,error := value - .preds]
 arima_joined$error %>% rmse
 
-saveRDS(arima_preds, "arima_carparts.rds")
+
 
 theta_preds <- train[timeseries %in% ts_to_fc, theta_monthly_fc(value), by = .(timeseries)]
 theta_joined <- merge(theta_preds, cp_dt[time > 39]) %>% .[ ,error := value - .preds]
@@ -138,18 +113,39 @@ basic_glrm <- h2o.glrm(
   ignore_const_cols = FALSE
 )
 
+
+saveRDS(basic_glrm, "glrm.rds")
+
 rec_scaled <- h2o.reconstruct(basic_glrm, dt_h2o, reverse_transform = TRUE)
+rec_simple <- h2o.reconstruct(glrm_one, dt_h2o, reverse_transform = TRUE)
 
 err <- (as.matrix(matrix_dt) - as.matrix(rec_scaled))
-err %>% rmse
+err_simple <- (as.matrix(matrix_dt) - as.matrix(rec_simple))
 
-rec_rmse <- tibble(timeseries = err %>% colnames(), rec_rmse = err %>% apply(2, rmse))
+rec_rmse <- tibble(
+  timeseries = err %>% colnames(), 
+  rec_rmse = err %>% apply(2, rmse),
+  rec_simple_rmse = err_simple %>% apply(2, rmse),
+  adi = matrix_dt %>% apply(2, adi),
+  cv2 = matrix_dt %>% apply(2, cv2),
+  n = matrix_dt %>% apply(2, length_non_na)
+)
+
 
 global_ar_rmse <- preds_joined %>%
   group_by(timeseries) %>%
   summarize(rmse = rmse(error))
 
+arima_rmse <- arima_joined %>%
+  group_by(timeseries) %>%
+  summarize(rmse = rmse(error))
+
+theta_rmse <- theta_joined %>%
+  group_by(timeseries) %>%
+  summarize(rmse = rmse(error))
+
 library(ggplot2)
+
 rec_rmse %>% 
   left_join(global_ar_rmse) %>% 
   ggplot(aes(x = rec_rmse, y = rmse)) +
@@ -158,34 +154,56 @@ rec_rmse %>%
   scale_y_log10() +
   geom_smooth(method = "lm")
 
-ar_ds <- rec_rmse %>% 
-  left_join(global_ar_rmse) 
+rec_rmse %>% 
+  left_join(global_ar_rmse) %>% 
+  ggplot(aes(x = rec_simple_rmse, y = rmse)) +
+  geom_point() +
+  scale_x_log10() +
+  scale_y_log10() +
+  geom_smooth(method = "lm")
 
-lm(rmse ~ rec_rmse, ar_ds) %>% summary
+perf_stats_ds <- rec_rmse %>% 
+  left_join(global_ar_rmse) %>% 
+  left_join(select(arima_rmse, timeseries, arima_rmse = rmse)) %>%
+  left_join(select(theta_rmse, timeseries, theta_rmse = rmse))
 
-non_scaled_glrm <- h2o.glrm(
-  training_frame = dt_h2o,
-  k = 20, 
-  loss = "Quadratic",
-  regularization_x = "None", 
-  regularization_y = "None", 
-  transform = "NONE", 
-  max_iterations = 2000,
-  seed = 123
-)
+perf_stats_ds %>%
+  select(-n) %>%
+  tidyr::gather(key = variable, value = value, -timeseries, -rmse) %>%
+  ggplot(aes(x = value, y = rmse)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  facet_wrap(~variable, scales = "free_x")
+
+perf_stats_ds %>%
+  ggplot(aes(x = rmse, y = arima_rmse)) +
+  geom_point() +
+  geom_smooth(method = "lm")
+
+perf_stats_ds %>%
+  ggplot(aes(x = rmse, y = theta_rmse)) +
+  geom_point() +
+  geom_smooth(method = "lm")
+
+perf_stats_ds %>%
+  select(timeseries, rmse, arima_rmse, theta_rmse) %>%
+  tidyr::gather(key = var, value = value, -timeseries) %>%
+  ggplot(aes(x = value, group = var, color = var)) +
+  stat_ecdf() 
+  
 
 
-summary(basic_glrm)
+lm(rmse ~ rec_rmse + adi + cv2, perf_stats_ds) %>% summary
+lm(rmse ~ rec_simple_rmse + adi + cv2, perf_stats_ds) %>% summary
 
-plot(basic_glrm)
+lm(arima_rmse ~ rec_rmse + adi + cv2, perf_stats_ds) %>% summary
+lm(theta_rmse ~ rec_rmse + adi + cv2, perf_stats_ds) %>% summary
+lm(perf_diff ~ rec_rmse + adi + cv2, perf_stats_ds %>% mutate(perf_diff = rmse - arima_rmse)) %>% summary
+lm(perf_diff ~ rec_rmse + adi + cv2, perf_stats_ds %>% mutate(perf_diff = rmse - theta_rmse)) %>% summary
 
-basic_glrm@model$importance
+perf_stats_ds %>%
+  mutate(perf_diff = rmse - arima_rmse) %>% 
+  ggplot(aes(x = rec_rmse, y = perf_diff)) +
+  geom_point() +
+  geom_smooth(method = "lm")
 
-contains_na <- is.na(carparts[1:39,]) %>% colSums() %>% `>`(0)
-carparts[1:39,contains_na] %>% View
-
-library(tsfeatures)
-
-tsfeatures::stl_features(carparts[1:39,100] %>% na.omit() %>% ts(frequency = 12))
-tsfeatures::entropy(carparts[1:39,100] %>% na.omit() %>% ts(frequency = 12))
-tsfeatures::entropy(carparts[1:39,1101] %>% na.omit() %>% ts(frequency = 12))
